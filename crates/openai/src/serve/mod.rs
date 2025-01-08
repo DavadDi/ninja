@@ -5,28 +5,16 @@ mod preauth;
 mod proxy;
 mod puid;
 #[cfg(feature = "template")]
-mod route;
+mod router;
 mod signal;
 mod turnstile;
 mod whitelist;
-
-use axum::body::Body;
-use axum::extract::Path;
-use axum::headers::authorization::Bearer;
-use axum::headers::Authorization;
-use axum::http::Response;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::routing::{any, post};
-use axum::Router;
-use axum::{Json, TypedHeader};
-use axum_server::{AddrIncomingConfig, Handle};
 
 use self::proxy::ext::RequestExt;
 use self::proxy::ext::SendRequestExt;
 use self::proxy::resp::response_convert;
 use crate::arkose;
+use crate::arkose::ArkoseContext;
 use crate::arkose::ArkoseToken;
 use crate::auth::model::{AccessToken, AuthAccount, RefreshToken, SessionAccessToken};
 use crate::auth::provide::AuthProvider;
@@ -37,13 +25,26 @@ use crate::dns;
 use crate::proxy::{InnerProxy, Proxy};
 use crate::serve::error::ProxyError;
 use crate::serve::error::ResponseError;
-use crate::serve::middleware::tokenbucket::{Strategy, TokenBucketLimitContext};
+use crate::serve::middleware::tokenbucket::{Strategy, TokenBucketProvider};
 use crate::{info, warn, with_context};
 use crate::{URL_CHATGPT_API, URL_PLATFORM_API};
+use axum::body::Body;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::headers::authorization::Bearer;
+use axum::headers::Authorization;
 use axum::http::header;
+use axum::http::Response;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::routing::{any, post};
+use axum::Router;
+use axum::{Json, TypedHeader};
 use axum_extra::extract::cookie;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::HttpConfig;
+use axum_server::{AddrIncomingConfig, Handle};
 use std::net::SocketAddr;
 use std::ops::Not;
 use std::str::FromStr;
@@ -62,12 +63,16 @@ fn print_boot_message(inner: &Args) {
     info!("Concurrent limit: {}", inner.concurrent_limit);
     info!("Timeout {} seconds", inner.timeout);
     info!("Connect timeout {} seconds", inner.connect_timeout);
-    info!("TCP keepalive: {}", inner.no_keepalive.not());
     info!("Keepalive {} seconds", inner.tcp_keepalive);
+    info!("TCP keepalive: {}", inner.no_keepalive.not());
     info!("Cookie store: {}", inner.cookie_store);
-    info!("Direct connection: {}", inner.enable_direct);
-    info!("File endpoint: {}", inner.enable_file_proxy);
-    info!("Arkose token endpoint: {}", inner.enable_arkose_proxy);
+    info!("Enable direct connection: {}", inner.enable_direct);
+    info!("Enable WebUI: {}", inner.enable_webui);
+    info!("Enable File endpoint: {}", inner.enable_file_proxy);
+    info!(
+        "Enable Arkose token endpoint: {}",
+        inner.enable_arkose_proxy
+    );
     info!(
         "ArkoseLabs GPT-3.5 experiment: {}",
         inner.arkose_gpt3_experiment
@@ -98,11 +103,6 @@ fn print_boot_message(inner: &Args) {
             }
         }
     });
-
-    info!(
-        "Starting HTTP(S) server at http(s)://{:?}",
-        inner.bind.expect("bind address required")
-    );
 }
 
 pub struct Serve(Args);
@@ -158,13 +158,12 @@ impl Serve {
 
         // init auth layer provider
         let app_layer = {
-            let limit_context = TokenBucketLimitContext::from((
-                Strategy::from_str(self.0.tb_store_strategy.as_str())?,
+            let limit_context = TokenBucketProvider::from((
+                Strategy::from_str(self.0.tb_strategy.as_str())?,
                 self.0.tb_enable,
                 self.0.tb_capacity,
                 self.0.tb_fill_rate,
                 self.0.tb_expired,
-                self.0.tb_redis_url.clone(),
             ));
 
             tower::ServiceBuilder::new()
@@ -188,7 +187,7 @@ impl Serve {
             .route("/auth/sess_token", post(post_sess_token))
             .route("/auth/billing", post(post_billing));
 
-        let router = route::config(
+        let router = router::config(
             // Enable arkose token endpoint proxy
             if self.0.enable_arkose_proxy {
                 router.route("/auth/arkose_token/:path", get(get_arkose_token))
@@ -208,15 +207,14 @@ impl Serve {
         // Fast dns test
         dns::fast::load_fastest_dns(self.0.fastest_dns).await?;
 
-        // Spawn a task to check wan address.
-        tokio::spawn(check_wan_address());
+        // check wan address.
+        check_wan_address().await;
+
+        // upgrade arkose version.
+        tokio::spawn(with_context!(arkose_context).periodic_upgrade());
 
         // http server tcp keepalive
-        let tcp_keepalive = if self.0.no_keepalive {
-            None
-        } else {
-            Some(Duration::from_secs(self.0.tcp_keepalive as u64 + 1))
-        };
+        let tcp_keepalive = Duration::from_secs(self.0.tcp_keepalive as u64 + 1);
 
         // http server config
         let http_config = HttpConfig::new()
@@ -228,7 +226,7 @@ impl Serve {
         // http server incoming config
         let incoming_config = AddrIncomingConfig::new()
             .tcp_sleep_on_accept_errors(true)
-            .tcp_keepalive(tcp_keepalive)
+            .tcp_keepalive(Some(tcp_keepalive))
             .build();
 
         // http server mitm signal
@@ -251,6 +249,11 @@ impl Serve {
                 warn!("PreAuth proxy error: {}", err);
             }
         }
+
+        info!(
+            "Starting HTTP(S) server at http(s)://{:?}",
+            self.0.bind.unwrap()
+        );
 
         // Run http server
         let result = match (self.0.tls_cert, self.0.tls_key) {
@@ -345,7 +348,8 @@ async fn post_access_token(
 
     if let Some(auth_key) = with_context!(auth_key) {
         // check bearer token exist
-        let bearer = bearer.ok_or(ResponseError::Unauthorized(ProxyError::AuthKeyRequired))?;
+        let bearer =
+            bearer.ok_or_else(|| ResponseError::Unauthorized(ProxyError::AuthKeyRequired))?;
         if auth_key.ne(bearer.token()) {
             return Err(ResponseError::Forbidden(ProxyError::AuthKeyError));
         }
@@ -388,17 +392,39 @@ async fn post_revoke_token(
 
 /// GET /auth/arkose_token/:path
 /// Example: /auth//arkose_token/35536E1E-65B4-4D96-9D97-6ADB7EFF8147
+#[derive(serde::Deserialize)]
+struct Blob {
+    blob: Option<String>,
+}
+
 async fn get_arkose_token(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     pk: Path<String>,
+    blob: Option<Query<Blob>>,
 ) -> Result<Json<ArkoseToken>, ResponseError> {
+    // Require auth key
+    if let Some(auth_key) = with_context!(auth_key) {
+        // check bearer token exist
+        let bearer =
+            bearer.ok_or_else(|| ResponseError::Unauthorized(ProxyError::AuthKeyRequired))?;
+        if auth_key.ne(bearer.token()) {
+            return Err(ResponseError::Forbidden(ProxyError::AuthKeyError));
+        }
+    }
+
+    // Require arkose token endpoint public key
     let typed = arkose::Type::from_pk(pk.as_str()).map_err(ResponseError::BadRequest)?;
-    // 35536E1E-65B4-4D96-9D97-6ADB7EFF8147 need access token
-    let identifier = bearer.map(|v| v.token().to_owned());
-    ArkoseToken::new_from_context(typed, identifier)
-        .await
-        .map(Json)
-        .map_err(ResponseError::ExpectationFailed)
+
+    ArkoseToken::new_from_context(
+        ArkoseContext::builder()
+            .client(with_context!(arkose_client))
+            .typed(typed)
+            .identifier(blob.map(|v| v.0.blob).flatten())
+            .build(),
+    )
+    .await
+    .map(Json)
+    .map_err(ResponseError::ExpectationFailed)
 }
 
 /// match path /dashboard/{tail.*}

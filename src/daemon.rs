@@ -22,7 +22,12 @@ pub(super) fn serve(mut args: ServeArgs, relative_path: bool) -> anyhow::Result<
     }
 
     let arkose_solver = match args.arkose_solver_key.as_ref() {
-        Some(key) => Some(ArkoseSolver::new(args.arkose_solver.clone(), key.clone())),
+        Some(client_key) => Some(ArkoseSolver::new(
+            args.arkose_solver,
+            client_key.clone(),
+            args.arkose_solver_endpoint,
+            args.arkose_solver_limit,
+        )),
         None => None,
     };
 
@@ -64,16 +69,13 @@ pub(super) fn serve(mut args: ServeArgs, relative_path: bool) -> anyhow::Result<
         .visitor_email_whitelist(args.visitor_email_whitelist)
         .cf_site_key(args.cf_site_key)
         .cf_secret_key(args.cf_secret_key)
-        .disable_ui(args.disable_webui)
+        .enable_webui(args.enable_webui)
         .arkose_endpoint(args.arkose_endpoint)
-        .arkose_gpt3_har_dir(args.arkose_gpt3_har_dir)
-        .arkose_gpt4_har_dir(args.arkose_gpt4_har_dir)
-        .arkose_auth_har_dir(args.arkose_auth_har_dir)
-        .arkose_platform_har_dir(args.arkose_platform_har_dir)
         .arkose_gpt3_experiment(args.arkose_gpt3_experiment)
         .arkose_gpt3_experiment_solver(args.arkose_gpt3_experiment_solver)
-        .arkose_har_upload_key(args.arkose_har_upload_key)
         .arkose_solver(arkose_solver)
+        .arkose_solver_tguess_endpoint(args.arkose_solver_tguess_endpoint)
+        .arkose_solver_image_dir(args.arkose_solver_image_dir)
         .enable_file_proxy(args.enable_file_proxy)
         .enable_arkose_proxy(args.enable_arkose_proxy)
         .pbind(args.pbind)
@@ -84,8 +86,7 @@ pub(super) fn serve(mut args: ServeArgs, relative_path: bool) -> anyhow::Result<
     #[cfg(feature = "limit")]
     let builder = builder
         .tb_enable(args.tb_enable)
-        .tb_store_strategy(args.tb_store_strategy)
-        .tb_redis_url(args.tb_redis_url)
+        .tb_strategy(args.tb_strategy)
         .tb_capacity(args.tb_capacity)
         .tb_fill_rate(args.tb_fill_rate)
         .tb_expired(args.tb_expired);
@@ -277,14 +278,14 @@ pub(super) fn generate_template(out: Option<PathBuf>) -> anyhow::Result<()> {
         timeout: 600,
         connect_timeout: 60,
         tcp_keepalive: 60,
-        tb_store_strategy: "mem".to_string(),
-        tb_redis_url: "redis://127.0.0.1:6379".to_string(),
+        tb_strategy: "mem".to_string(),
         tb_enable: false,
         tb_capacity: 60,
         tb_fill_rate: 1,
         tb_expired: 86400,
         cookie_store: true,
         pool_idle_timeout: 90,
+        arkose_solver_limit: 3,
         level: "info".to_owned(),
         pcert: PathBuf::from("ca/cert.crt"),
         pkey: PathBuf::from("ca/key.pem"),
